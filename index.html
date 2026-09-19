@@ -1,0 +1,898 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="theme-color" content="#0f1117">
+  <title>😴 Sleep Tracker</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Inter', sans-serif; background: #0f1117; color: #e2e8f0; min-height: 100vh; }
+    #app { max-width: 480px; margin: 0 auto; }
+    button { font-family: inherit; }
+    input, textarea { font-family: inherit; }
+    textarea { resize: none; }
+  </style>
+</head>
+<body>
+<div id="app"></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+<script type="text/babel">
+const { useState, useMemo, useEffect, useRef } = React;
+
+const API_URL = "https://script.google.com/macros/s/AKfycbz8rAJVExiTsh_dzadIi4NuSVoSsUgrWj3qk9AfdIsWZ_fmsufS1sEiB7BhKY2fxIyh/exec";
+const SUPP_LIST = ["Mela", "Mag", "Ashwa", "Thre", "ThreMix", "Patch", "Herbs", "Drift", "AntiHist"];
+const FEEL_OPTIONS = ["Very Poor", "Poor", "Fair", "Good", "Very Good"];
+const FEEL_COLOR = { "Very Poor": "#ef4444", Poor: "#f97316", Fair: "#eab308", Good: "#22c55e", "Very Good": "#10b981" };
+
+// ─── Data conversion: Sheet → App ───────────────────────────────────────────
+// Sheet sends: date="2026-06-25", bedTime="22:00", duration=355 (mins), percent=0.845
+function parseSheetRow(row) {
+  const durationMins = row["Duration "] ? Math.round(Number(row["Duration "])) : null;
+  const interuptMins = row["InteruptMins"] !== "" ? Number(row["InteruptMins"]) : 0;
+  const rawPct = row["Percent"] !== "" ? Number(row["Percent"]) : null;
+  const percent = rawPct != null ? (rawPct > 1 ? Math.round(rawPct * 10) / 10 : Math.round(rawPct * 1000) / 10) : null;
+  return {
+    id: row["_rowIndex"],
+    _rowIndex: row["_rowIndex"],
+    date: row["Sleep Date"] || "",
+    durationMins,
+    duration: durationMins ? fmtDuration(durationMins) : "",
+    bedTime: row["Bed Time"] || "",
+    sleepMin: row["SleepMin"] !== "" ? Number(row["SleepMin"]) : 0,
+    interuptMins,
+    awakeTime: row["Awake Time"] || "",
+    feel: row["Feel"] || "",
+    meds: row["Meds"] || "",
+    interuptCount: row["InteruptCount"] !== "" ? Number(row["InteruptCount"]) : 0,
+    leftBed: row["LeftBed"] !== "" ? Number(row["LeftBed"]) : null,
+    percent,
+    comment: (row["Sleep Comment"] || "").trim(),
+    lunch: (row["Lunch"] || "").trim(),
+    dinner: (row["Dinner"] || "").trim(),
+    gym: row["Gym"] || "",
+    nextDay: (row["NEXT DAY"] || "").trim(),
+  };
+}
+
+// ─── Data conversion: App → Sheet ───────────────────────────────────────────
+// Send back same clean formats the sheet understands
+function entryToSheetRow(entry, isNew) {
+  return {
+    "Sleep Date": entry.date,
+    // For new entries write formulas; for edits leave blank so existing formula stays
+    "Duration ": isNew ? "=((A2+1)+F2)-(A2+C2)-TIME(0,(D2+E2),0)" : "",
+    "Bed Time": entry.bedTime || "",
+    "SleepMin": entry.sleepMin || 0,
+    "InteruptMins": entry.interuptMins || 0,
+    "Awake Time": entry.awakeTime || "",
+    "Feel": entry.feel || "",
+    "Meds": entry.meds || "",
+    "InteruptCount": entry.interuptCount || 0,
+    "LeftBed": entry.leftBed ?? "",
+    "Percent": isNew ? "=B2/(((A2+1)+F2)-(A2+C2))" : "",
+    "Sleep Comment": entry.comment || "",
+    "Lunch": entry.lunch || "",
+    "Dinner": entry.dinner || "",
+    "Gym": entry.gym || "",
+    "NEXT DAY": entry.nextDay || "",
+  };
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+function toMinutes(t) {
+  if (!t) return null;
+  const [h, m] = t.split(":").map(Number);
+  return h * 60 + m;
+}
+
+function calcDuration(bedTime, sleepMin, awakeTime, interuptMins) {
+  if (!bedTime || !awakeTime || sleepMin == null) return null;
+  let bed = toMinutes(bedTime) + (Number(sleepMin) || 0);
+  let wake = toMinutes(awakeTime);
+  if (wake < bed) wake += 24 * 60;
+  const total = wake - bed - (Number(interuptMins) || 0);
+  return total > 0 ? total : null;
+}
+
+function fmtDuration(mins) {
+  if (!mins) return "—";
+  return `${Math.floor(mins / 60)}h ${mins % 60}m`;
+}
+
+function avg(arr) {
+  const v = arr.filter(x => x != null && !isNaN(x));
+  return v.length ? v.reduce((a, b) => a + b, 0) / v.length : null;
+}
+
+function dateShort(d) {
+  return new Date(d + "T00:00:00").toLocaleDateString("en-AU", { day: "numeric", month: "short" });
+}
+
+// Builds all derived data for a rolling-average chart: points, path, target line,
+// peak/trough, and pagination info. Shared by the mini dashboard chart and the
+// expanded full-page chart so their math (and therefore their visual scale) always matches.
+function buildRollingChart(allSorted, chartOffset, WINDOW, chartW, chartH, TARGET) {
+  if (allSorted.length < 2) return null;
+
+  // Global rolling 7-day avg across ALL history, used only to fix the y-axis
+  // scale so peaks/troughs render consistently no matter which window you're viewing
+  const allRolling = allSorted.map((e, i) => {
+    const win = allSorted.slice(Math.max(0, i - 6), i + 1);
+    return avg(win.map(x => x.durationMins));
+  }).filter(a => a != null);
+
+  const windowEnd = new Date(); windowEnd.setDate(windowEnd.getDate() - chartOffset);
+  const windowStart = new Date(windowEnd); windowStart.setDate(windowStart.getDate() - WINDOW);
+
+  const contextStart = new Date(windowStart); contextStart.setDate(contextStart.getDate() - 6);
+  const contextEntries = allSorted.filter(e => new Date(e.date + "T00:00:00") >= contextStart);
+
+  const withRolling = contextEntries.map((e, i) => {
+    const win = contextEntries.slice(Math.max(0, i - 6), i + 1);
+    const a = avg(win.map(x => x.durationMins));
+    return { date: e.date, avg: a };
+  }).filter(p => p.avg != null);
+
+  const rollingPoints = withRolling.filter(p => {
+    const d = new Date(p.date + "T00:00:00");
+    return d >= windowStart && d <= windowEnd;
+  });
+
+  if (!rollingPoints.length) return null;
+
+  const canGoBack = allSorted.some(e => new Date(e.date + "T00:00:00") < windowStart);
+  const canGoForward = chartOffset > 0;
+
+  const maxVal = Math.max(TARGET, ...allRolling);
+  const minVal = Math.min(...allRolling) - 30;
+  const range = maxVal - minVal || 1;
+
+  const pts = rollingPoints.map((p, i) => {
+    const x = (i / Math.max(rollingPoints.length - 1, 1)) * chartW;
+    const y = chartH - ((p.avg - minVal) / range) * chartH;
+    return { x, y, ...p };
+  });
+
+  const pathD = pts.map((p, i) => `${i === 0 ? "M" : "L"}${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(" ");
+  const targetY = chartH - ((TARGET - minVal) / range) * chartH;
+  const labelPts = pts.filter((_, i) => i === 0 || i === pts.length - 1 || i % Math.max(1, Math.floor(pts.length / 4)) === 0);
+
+  const peakPoint = pts.reduce((a, b) => (b.avg > a.avg ? b : a), pts[0]);
+  const troughPoint = pts.reduce((a, b) => (b.avg < a.avg ? b : a), pts[0]);
+
+  const windowLabel = chartOffset === 0
+    ? `Last ${WINDOW} days`
+    : `${windowStart.toLocaleDateString("en-AU", { day: "numeric", month: "short" })} – ${windowEnd.toLocaleDateString("en-AU", { day: "numeric", month: "short" })}`;
+
+  return { pts, pathD, targetY, labelPts, peakPoint, troughPoint, minVal, maxVal, range, canGoBack, canGoForward, windowLabel, windowStart, windowEnd, rollingPoints };
+}
+
+function formatDate(s) {
+  if (!s) return "";
+  return new Date(s + "T00:00:00").toLocaleDateString("en-AU", { weekday: "short", day: "numeric", month: "short" });
+}
+
+function yesterdayStr() {
+  const d = new Date(); d.setDate(d.getDate() - 1);
+  return d.toLocaleDateString("en-CA");
+}
+
+function nextLogDate(sortedEntries) {
+  // Returns the date string for the next unlogged night
+  if (!sortedEntries.length) return yesterdayStr();
+  const lastDate = new Date(sortedEntries[0].date + "T00:00:00");
+  const next = new Date(lastDate); next.setDate(next.getDate() + 1);
+  return next.toLocaleDateString("en-CA");
+}
+
+function isYesterdayLogged(sortedEntries) {
+  if (!sortedEntries.length) return false;
+  return sortedEntries[0].date === yesterdayStr();
+}
+
+function buildMeds(selected, extra) {
+  const parts = SUPP_LIST.filter(s => selected.includes(s));
+  if (extra && extra.trim()) parts.push(extra.trim());
+  return parts.join(" + ");
+}
+
+function parseMeds(str) {
+  if (!str) return { suppSelected: [], suppExtra: "" };
+  const parts = str.split("+").map(s => s.trim());
+  return {
+    suppSelected: parts.filter(p => SUPP_LIST.includes(p)),
+    suppExtra: parts.filter(p => !SUPP_LIST.includes(p)).join(" + "),
+  };
+}
+
+const emptyForm = () => ({
+  date: yesterdayStr(), bedTime: "22:00", sleepMin: 10, interuptMins: "",
+  awakeTime: "05:00", feel: "", suppSelected: [],
+  suppExtra: "", interuptCount: "", comment: "", lunch: "", dinner: "",
+  gym: "", nextDay: "", leftBed: "", durationMins: null, percent: null,
+});
+
+const IS = { background: "#0f1117", border: "1px solid #2d3748", borderRadius: 8, color: "#e2e8f0", padding: "8px 10px", fontSize: 15, outline: "none" };
+
+function Stat({ label, value, large }) {
+  return (
+    <div style={{ textAlign: "center" }}>
+      <div style={{ fontSize: large ? 22 : 18, fontWeight: 800, color: "#ffffff" }}>{value || "—"}</div>
+      <div style={{ fontSize: 12, color: "#718096", marginTop: 2 }}>{label}</div>
+    </div>
+  );
+}
+
+function Section({ label, children }) {
+  return (
+    <div style={{ background: "#1a2035", borderRadius: 12, padding: 14, marginBottom: 12 }}>
+      <div style={{ fontSize: 11, fontWeight: 700, color: "#4a5568", textTransform: "uppercase", letterSpacing: 1, marginBottom: 10 }}>{label}</div>
+      {children}
+    </div>
+  );
+}
+
+function Row({ label, children }) {
+  return (
+    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10, gap: 8 }}>
+      <div style={{ fontSize: 14, color: "#718096", minWidth: 90 }}>{label}</div>
+      {children}
+    </div>
+  );
+}
+
+// ─── Main App ─────────────────────────────────────────────────────────────────
+function App() {
+  const [entries, setEntries] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+  const [syncing, setSyncing] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const [view, setView] = useState("dashboard");
+  const [form, setForm] = useState(emptyForm());
+  const [editId, setEditId] = useState(null);
+  const [chartOffset, setChartOffset] = useState(0); // days back from today
+  const [saveError, setSaveError] = useState(null);
+  const [dirty, setDirty] = useState(false);
+  const [lastEditedId, setLastEditedId] = useState(null);
+  const rowRefs = useRef({});
+  const [chartExpanded, setChartExpanded] = useState(false);
+  const [scrubIndex, setScrubIndex] = useState(null);
+  const [isLandscape, setIsLandscape] = useState(
+    typeof window !== "undefined" && window.matchMedia("(orientation: landscape)").matches
+  );
+
+  useEffect(() => {
+    const mq = window.matchMedia("(orientation: landscape)");
+    const handler = () => setIsLandscape(mq.matches);
+    if (mq.addEventListener) mq.addEventListener("change", handler);
+    else mq.addListener(handler);
+    return () => {
+      if (mq.removeEventListener) mq.removeEventListener("change", handler);
+      else mq.removeListener(handler);
+    };
+  }, []);
+
+  useEffect(() => { fetchEntries(); }, []);
+
+  // Auto-scroll back to the record we were editing when returning to History
+  useEffect(() => {
+    if (view === "history" && lastEditedId != null) {
+      const el = rowRefs.current[lastEditedId];
+      if (el) {
+        const t = setTimeout(() => {
+          el.scrollIntoView({ behavior: "smooth", block: "center" });
+          setLastEditedId(null);
+        }, 50);
+        return () => clearTimeout(t);
+      } else {
+        setLastEditedId(null);
+      }
+    }
+  }, [view, lastEditedId, entries]);
+
+  async function fetchEntries() {
+    setLoading(true); setError(null);
+    try {
+      const res = await fetch(`${API_URL}?action=getAll`, { redirect: "follow" });
+      const data = await res.json();
+      if (data.entries) {
+        setEntries(data.entries.map(parseSheetRow).filter(e => e.date));
+      } else {
+        setError(data.error || "Could not load sheet data.");
+      }
+    } catch (err) {
+      setError("Failed to load: " + err.message);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  function handleChange(field, val) {
+    setDirty(true);
+    setForm(f => {
+      const u = { ...f, [field]: val };
+      if (["bedTime", "sleepMin", "awakeTime", "interuptMins"].includes(field)) {
+        const d = calcDuration(u.bedTime, u.sleepMin, u.awakeTime, u.interuptMins);
+        u.durationMins = d;
+        // Percent = Duration / (AwakeTime - BedTime) matching sheet formula
+        const windowMins = (() => {
+          let bed = toMinutes(u.bedTime); let wake = toMinutes(u.awakeTime);
+          if (wake < bed) wake += 24 * 60; return wake - bed;
+        })();
+        u.percent = d && windowMins ? Math.round((d / windowMins) * 1000) / 10 : null;
+      }
+      return u;
+    });
+  }
+
+  async function handleSave() {
+    const durMins = calcDuration(form.bedTime, form.sleepMin, form.awakeTime, form.interuptMins);
+    const windowMins = (() => {
+      let bed = toMinutes(form.bedTime); let wake = toMinutes(form.awakeTime);
+      if (wake < bed) wake += 24 * 60; return wake - bed;
+    })();
+    const pct = durMins && windowMins ? Math.round((durMins / windowMins) * 1000) / 10 : null;
+    const entry = {
+      ...form,
+      id: editId || Date.now(),
+      sleepMin: Number(form.sleepMin) || 0,
+      interuptMins: Number(form.interuptMins) || 0,
+      interuptCount: Number(form.interuptCount) || 0,
+      durationMins: durMins,
+      duration: durMins ? fmtDuration(durMins) : "",
+      percent: pct,
+      meds: buildMeds(form.suppSelected, form.suppExtra),
+    };
+    const wasEditing = editId;
+    setSyncing(true);
+    setSaveError(null);
+    try {
+      if (editId) {
+        const rowIndex = entries.find(e => e.id === editId)?._rowIndex;
+        const sheetRow = entryToSheetRow(entry, false);
+        const res = await fetch(API_URL, { method: "POST", body: JSON.stringify({ action: "update", entry: { ...sheetRow, _rowIndex: rowIndex } }) });
+        const data = await res.json();
+        if (!data.success) throw new Error(data.error || "Save failed");
+      } else {
+        const sheetRow = entryToSheetRow(entry, true);
+        const res = await fetch(API_URL, { method: "POST", body: JSON.stringify({ action: "append", entry: sheetRow }) });
+        const data = await res.json();
+        if (!data.success) throw new Error(data.error || "Save failed");
+      }
+      // Always reload after save to get fresh row indices
+      await fetchEntries();
+      setSaved(true); setTimeout(() => setSaved(false), 2500);
+      setDirty(false);
+      if (wasEditing) {
+        setLastEditedId(wasEditing);
+        setForm(emptyForm()); setEditId(null); setView("history");
+      } else {
+        setForm(emptyForm()); setEditId(null); setView("dashboard");
+      }
+    } catch (err) {
+      setSaveError(err.message || "Error saving. Please try again.");
+    } finally {
+      setSyncing(false);
+    }
+  }
+
+  function startEdit(entry) {
+    const { suppSelected, suppExtra } = parseMeds(entry.meds);
+    const durMins = calcDuration(entry.bedTime, entry.sleepMin, entry.awakeTime, entry.interuptMins);
+    setForm({
+      date: entry.date, bedTime: entry.bedTime || "22:00",
+      sleepMin: entry.sleepMin ?? 10, interuptMins: entry.interuptMins ?? "",
+      awakeTime: entry.awakeTime || "05:00", feel: entry.feel || "Fair",
+      suppSelected, suppExtra, interuptCount: entry.interuptCount ?? "",
+      comment: entry.comment || "", lunch: entry.lunch || "",
+      dinner: entry.dinner || "", gym: entry.gym || "No",
+      nextDay: entry.nextDay || "", leftBed: entry.leftBed ?? "",
+      durationMins: durMins, percent: entry.percent ?? null,
+    });
+    setEditId(entry.id); setView("log");
+    setDirty(false); setSaveError(null);
+  }
+
+  function goToAdjacent(delta) {
+    if (dirty) return;
+    const idx = sorted.findIndex(e => e.id === editId);
+    if (idx === -1) return;
+    const targetIdx = idx + delta;
+    if (targetIdx < 0 || targetIdx >= sorted.length) return;
+    startEdit(sorted[targetIdx]);
+  }
+
+  const sorted = useMemo(() => [...entries].sort((a, b) => b.date.localeCompare(a.date)), [entries]);
+  const r7 = sorted.slice(0, 7), r14 = sorted.slice(0, 14);
+  const avg7d = avg(r7.map(e => e.durationMins)), avg14d = avg(r14.map(e => e.durationMins));
+  const avg7i = avg(r7.map(e => e.interuptMins)), avg14i = avg(r14.map(e => e.interuptMins));
+  const avg7p = avg(r7.map(e => e.percent)), avg14p = avg(r14.map(e => e.percent));
+  const latest = sorted[0];
+  const feelCounts7 = r7.reduce((a, e) => { if (e.feel) a[e.feel] = (a[e.feel] || 0) + 1; return a; }, {});
+
+  return (
+    <>
+    <div style={{ fontFamily: "system-ui,sans-serif", background: "#0f1117", minHeight: "100vh", color: "#e2e8f0", maxWidth: 480, margin: "0 auto" }}>
+
+      {/* Header */}
+      <div style={{ background: "#0f1117", padding: "16px 16px 0", position: "sticky", top: 0, zIndex: 10, borderBottom: "1px solid #1e2530" }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
+          <div>
+            <div style={{ fontSize: 18, fontWeight: 700, letterSpacing: "-0.3px" }}>😴 Sleep Tracker</div>
+            <div style={{ fontSize: 11, color: "#4a5568", marginTop: 1 }}>
+              {loading ? "Loading..." : `${entries.length} nights logged`}
+            </div>
+            <div style={{ fontSize: 10, color: "#2d3748", marginTop: 1 }}>v15</div>
+          </div>
+          <div>
+            {saved && <div style={{ background: "#065f46", color: "#6ee7b7", padding: "4px 10px", borderRadius: 20, fontSize: 12, fontWeight: 600 }}>✓ Saved</div>}
+            {syncing && <div style={{ background: "#1e3a5f", color: "#90cdf4", padding: "4px 10px", borderRadius: 20, fontSize: 12, fontWeight: 600 }}>⏳ Saving...</div>}
+          </div>
+        </div>
+        <div style={{ display: "flex", gap: 4 }}>
+          {[["dashboard", "Dashboard"], ["history", "History"]].map(([id, label]) => (
+            <button key={id} onClick={() => { if (editId) setLastEditedId(editId); setView(id); setEditId(null); setForm(emptyForm()); setDirty(false); setSaveError(null); }}
+              style={{ flex: 1, padding: "8px 4px", border: "none", borderRadius: "8px 8px 0 0",
+                background: view === id ? "#1a2035" : "transparent",
+                color: view === id ? "#818cf8" : "#4a5568",
+                fontWeight: view === id ? 700 : 400, fontSize: 13, cursor: "pointer",
+                borderBottom: view === id ? "2px solid #818cf8" : "2px solid transparent" }}>
+              {label}
+            </button>
+          ))}
+          {(view === "log") && (
+            <div style={{ flex: 1, padding: "8px 4px", textAlign: "center", fontSize: 13, fontWeight: 700,
+              color: "#818cf8", borderBottom: "2px solid #818cf8" }}>
+              {editId ? "Editing" : "New Entry"}
+            </div>
+          )}
+        </div>
+      </div>
+
+      <div style={{ padding: 16 }}>
+
+        {/* DASHBOARD */}
+        {view === "dashboard" && (
+          <div>
+            {loading && (
+              <div style={{ textAlign: "center", padding: 40, color: "#4a5568" }}>
+                <div style={{ fontSize: 28, marginBottom: 8 }}>😴</div>
+                <div style={{ fontSize: 13 }}>Loading from Google Sheets...</div>
+              </div>
+            )}
+            {error && (
+              <div style={{ background: "#4a1942", color: "#f9a8d4", padding: 12, borderRadius: 10, marginBottom: 12, fontSize: 13 }}>
+                ⚠️ {error}
+                <button onClick={fetchEntries} style={{ marginLeft: 8, background: "none", border: "none", color: "#f9a8d4", cursor: "pointer", textDecoration: "underline" }}>Retry</button>
+              </div>
+            )}
+            {!loading && !error && <>
+{(() => {
+                const alreadyDone = isYesterdayLogged(sorted);
+                return (
+                  <div style={{ marginBottom: 16 }}>
+                    <button
+                      disabled={alreadyDone}
+                      onClick={() => {
+                        const prev = sorted[0];
+                        setForm(f => ({ ...f, date: nextLogDate(sorted), bedTime: prev?.bedTime || "22:00", awakeTime: prev?.awakeTime || "05:00" }));
+                        setView("log");
+                      }}
+                      style={{ width: "100%", padding: 14, border: "none", borderRadius: 12, color: "white", fontWeight: 700, fontSize: 16, cursor: alreadyDone ? "not-allowed" : "pointer",
+                        background: alreadyDone ? "#2d3748" : "linear-gradient(135deg,#4f46e5,#7c3aed)", opacity: alreadyDone ? 0.6 : 1 }}>
+                      {alreadyDone ? "✓ Already logged today" : "+ Log Last Night"}
+                    </button>
+                    {alreadyDone && <div style={{ fontSize: 12, color: "#4a5568", textAlign: "center", marginTop: 6 }}>Come back tomorrow morning</div>}
+                  </div>
+                );
+              })()}
+
+              {latest && (
+                <div style={{ background: "#1a2035", borderRadius: 12, padding: 14, marginBottom: 16, border: `1px solid ${(FEEL_COLOR[latest.feel] || "#2d3748")}30` }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 10 }}>
+                    <div>
+                      <div style={{ fontSize: 11, color: "#4a5568", textTransform: "uppercase", letterSpacing: 1 }}>Last logged</div>
+                      <div style={{ fontSize: 14, fontWeight: 600, color: "#a0aec0", marginTop: 2 }}>{formatDate(latest.date)}</div>
+                    </div>
+                    <span style={{ background: (FEEL_COLOR[latest.feel] || "#718096") + "20", color: FEEL_COLOR[latest.feel] || "#a0aec0", padding: "3px 10px", borderRadius: 20, fontSize: 12, fontWeight: 700 }}>
+                      {latest.feel || "—"}
+                    </span>
+                  </div>
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8 }}>
+                    <Stat label="Sleep" value={fmtDuration(latest.durationMins)} large />
+                    <Stat label="Awake mins" value={latest.interuptMins != null ? `${latest.interuptMins}m` : "—"} />
+                    <Stat label="Efficiency" value={latest.percent != null ? `${latest.percent}%` : "—"} large />
+                  </div>
+                  {latest.comment && <div style={{ marginTop: 10, fontSize: 12, color: "#718096", fontStyle: "italic", lineHeight: 1.4 }}>"{latest.comment}"</div>}
+                </div>
+              )}
+
+              <div style={{ background: "#1a2035", borderRadius: 12, padding: 14, marginBottom: 16 }}>
+                <div style={{ fontSize: 12, fontWeight: 700, color: "#818cf8", marginBottom: 12, textTransform: "uppercase", letterSpacing: 0.8 }}>Averages</div>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 6, marginBottom: 8 }}>
+                  <div style={{ fontSize: 10, color: "#4a5568" }}></div>
+                  <div style={{ fontSize: 10, color: "#a0aec0", textAlign: "center", fontWeight: 700 }}>7 days</div>
+                  <div style={{ fontSize: 10, color: "#a0aec0", textAlign: "center", fontWeight: 700 }}>14 days</div>
+                </div>
+                {[
+                  ["Sleep duration", fmtDuration(avg7d && Math.round(avg7d)), fmtDuration(avg14d && Math.round(avg14d))],
+                  ["Awake mins", avg7i != null ? `${Math.round(avg7i)}m` : "—", avg14i != null ? `${Math.round(avg14i)}m` : "—"],
+                  ["Efficiency", avg7p != null ? `${avg7p.toFixed(1)}%` : "—", avg14p != null ? `${avg14p.toFixed(1)}%` : "—"],
+                ].map(([label, v7, v14]) => (
+                  <div key={label} style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 6, marginBottom: 6 }}>
+                    <div style={{ fontSize: 12, color: "#718096", alignSelf: "center" }}>{label}</div>
+                    <div style={{ fontSize: 16, fontWeight: 700, color: "#c3dafe", textAlign: "center" }}>{v7}</div>
+                    <div style={{ fontSize: 16, fontWeight: 700, color: "#a0aec0", textAlign: "center" }}>{v14}</div>
+                  </div>
+                ))}
+              </div>
+
+{(() => {
+                // Scrollable 60-day window chart with offset navigation
+                const WINDOW = 60;
+                const TARGET = 450;
+                const allSorted = sorted.slice().reverse(); // oldest first
+                const chartW = 320, chartH = 80;
+                const chart = buildRollingChart(allSorted, chartOffset, WINDOW, chartW, chartH, TARGET);
+                if (!chart) return null;
+                const { pts, pathD, targetY, labelPts, peakPoint, troughPoint, minVal, range, canGoBack, canGoForward, windowLabel, rollingPoints } = chart;
+
+                return (
+                  <div style={{ background: "#1a2035", borderRadius: 12, padding: 14, marginBottom: 16 }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 2 }}>
+                      <div style={{ fontSize: 12, fontWeight: 700, color: "#818cf8", textTransform: "uppercase", letterSpacing: 0.8 }}>7-Day Rolling Avg</div>
+                      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                        <button onClick={() => setChartOffset(o => o + WINDOW)} disabled={!canGoBack}
+                          style={{ background: "none", border: "none", color: canGoBack ? "#818cf8" : "#2d3748", fontSize: 18, cursor: canGoBack ? "pointer" : "default", padding: "0 4px", lineHeight: 1 }}>‹</button>
+                        <span style={{ fontSize: 10, color: "#4a5568", minWidth: 80, textAlign: "center" }}>{windowLabel}</span>
+                        <button onClick={() => setChartOffset(o => Math.max(0, o - WINDOW))} disabled={!canGoForward}
+                          style={{ background: "none", border: "none", color: canGoForward ? "#818cf8" : "#2d3748", fontSize: 18, cursor: canGoForward ? "pointer" : "default", padding: "0 4px", lineHeight: 1 }}>›</button>
+                        <button onClick={() => { setScrubIndex(null); setChartExpanded(true); }}
+                          title="Expand"
+                          style={{ background: "none", border: "none", color: "#818cf8", fontSize: 14, cursor: "pointer", padding: "0 2px 0 6px", lineHeight: 1 }}>⤢</button>
+                      </div>
+                    </div>
+                    <div style={{ fontSize: 11, color: "#4a5568", marginBottom: 10 }}>Duration (hrs) · dashed = 7h 30m target</div>
+                    <div style={{ overflowX: "auto" }}>
+                      <svg width="100%" viewBox={`0 0 ${chartW} ${chartH + 20}`} style={{ display: "block" }}>
+                        <line x1="0" y1={targetY.toFixed(1)} x2={chartW} y2={targetY.toFixed(1)}
+                          stroke="#4a5568" strokeWidth="1" strokeDasharray="4,3" />
+                        <path d={`${pathD} L${pts[pts.length-1].x},${chartH} L0,${chartH} Z`}
+                          fill="#818cf8" fillOpacity="0.1" />
+                        <path d={pathD} fill="none" stroke="#818cf8" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+                        {[pts[0], pts[pts.length - 1]].map((p, i) => (
+                          <circle key={i} cx={p.x.toFixed(1)} cy={p.y.toFixed(1)} r="3" fill="#818cf8" />
+                        ))}
+                        {labelPts.map((p, i) => (
+                          <text key={i} x={p.x.toFixed(1)} y={chartH + 14} textAnchor="middle" fontSize="9" fill="#e2e8f0">
+                            {new Date(p.date + "T00:00:00").toLocaleDateString("en-AU", { day: "numeric", month: "short" })}
+                          </text>
+                        ))}
+                        {[minVal, TARGET].map((v, i) => (
+                          <text key={i} x="2" y={chartH - ((v - minVal) / range) * chartH} fontSize="8" fill="#4a5568" dominantBaseline="middle">
+                            {Math.floor(v/60)}h{v%60 > 0 ? `${v%60}m` : ""}
+                          </text>
+                        ))}
+                        <circle cx={peakPoint.x.toFixed(1)} cy={peakPoint.y.toFixed(1)} r="4" fill="#fbbf24" stroke="#0f1117" strokeWidth="1.5" />
+                        <text x={peakPoint.x.toFixed(1)} y={(peakPoint.y > chartH / 2 ? peakPoint.y - 8 : peakPoint.y + 15).toFixed(1)} textAnchor="middle" fontSize="8" fontWeight="700" fill="#fbbf24">
+                          {dateShort(peakPoint.date)}
+                        </text>
+                        {troughPoint.date !== peakPoint.date && (
+                          <>
+                            <circle cx={troughPoint.x.toFixed(1)} cy={troughPoint.y.toFixed(1)} r="4" fill="#60a5fa" stroke="#0f1117" strokeWidth="1.5" />
+                            <text x={troughPoint.x.toFixed(1)} y={(troughPoint.y > chartH / 2 ? troughPoint.y - 8 : troughPoint.y + 15).toFixed(1)} textAnchor="middle" fontSize="8" fontWeight="700" fill="#60a5fa">
+                              {dateShort(troughPoint.date)}
+                            </text>
+                          </>
+                        )}
+                      </svg>
+                    </div>
+                    <div style={{ display: "flex", justifyContent: "space-between", marginTop: 4 }}>
+                      <span style={{ fontSize: 11, color: "#a0aec0" }}>Current 7-day avg: <span style={{ color: "#818cf8", fontWeight: 700 }}>{fmtDuration(Math.round(avg7d || 0))}</span></span>
+                      <span style={{ fontSize: 11, color: "#4a5568" }}>{rollingPoints.length} nights</span>
+                    </div>
+                    <div style={{ display: "flex", justifyContent: "space-between", marginTop: 4 }}>
+                      <span style={{ fontSize: 11, color: "#60a5fa" }}>Low: {fmtDuration(Math.round(troughPoint.avg))} ({dateShort(troughPoint.date)})</span>
+                      <span style={{ fontSize: 11, color: "#fbbf24" }}>High: {fmtDuration(Math.round(peakPoint.avg))} ({dateShort(peakPoint.date)})</span>
+                    </div>
+                  </div>
+                );
+              })()}
+            </>}
+          </div>
+        )}
+
+        {/* LOG FORM */}
+        {view === "log" && (
+          <div>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 16 }}>
+              <div style={{ fontSize: 14, fontWeight: 700, color: "#a0aec0" }}>
+                {editId ? "✏️ Edit Entry" : "🌙 Log Last Night"}
+              </div>
+              {editId && (() => {
+                const idx = sorted.findIndex(e => e.id === editId);
+                const canPrev = !dirty && idx !== -1 && idx < sorted.length - 1;
+                const canNext = !dirty && idx > 0;
+                return (
+                  <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                    <button onClick={() => goToAdjacent(1)} disabled={!canPrev}
+                      style={{ background: "none", border: "none", color: canPrev ? "#818cf8" : "#2d3748", fontSize: 12, fontWeight: 700, cursor: canPrev ? "pointer" : "default", padding: "4px 6px" }}>
+                      ‹ Older
+                    </button>
+                    <button onClick={() => goToAdjacent(-1)} disabled={!canNext}
+                      style={{ background: "none", border: "none", color: canNext ? "#818cf8" : "#2d3748", fontSize: 12, fontWeight: 700, cursor: canNext ? "pointer" : "default", padding: "4px 6px" }}>
+                      Newer ›
+                    </button>
+                  </div>
+                );
+              })()}
+            </div>
+            {editId && dirty && (
+              <div style={{ fontSize: 11, color: "#4a5568", marginTop: -10, marginBottom: 14 }}>
+                Save or discard changes to navigate between records
+              </div>
+            )}
+            {saveError && (
+              <div style={{ background: "#4a1942", color: "#f9a8d4", padding: 12, borderRadius: 10, marginBottom: 14, fontSize: 13 }}>
+                ⚠️ {saveError}
+                <button onClick={() => setSaveError(null)} style={{ marginLeft: 8, background: "none", border: "none", color: "#f9a8d4", cursor: "pointer", textDecoration: "underline" }}>Dismiss</button>
+              </div>
+            )}
+
+            <Section label="When">
+              <Row label="Date"><input type="date" value={form.date} onChange={e => handleChange("date", e.target.value)} style={IS} /></Row>
+              <Row label="Bed time"><input type="time" value={form.bedTime} onChange={e => handleChange("bedTime", e.target.value)} style={IS} /></Row>
+              <Row label="Mins to sleep"><input type="number" value={form.sleepMin} onChange={e => handleChange("sleepMin", e.target.value)} style={{ ...IS, width: 70 }} min={0} max={240} /></Row>
+              <Row label="Wake time"><input type="time" value={form.awakeTime} onChange={e => handleChange("awakeTime", e.target.value)} style={IS} /></Row>
+              <Row label="Awake mins"><input type="number" value={form.interuptMins} onChange={e => handleChange("interuptMins", e.target.value)} style={{ ...IS, width: 70 }} min={0} /></Row>
+              {form.durationMins && (
+                <div style={{ display: "flex", justifyContent: "space-around", marginTop: 8, padding: "10px 0 4px" }}>
+                  <div style={{ textAlign: "center" }}>
+                    <div style={{ fontSize: 22, fontWeight: 800, color: "#ffffff" }}>{fmtDuration(form.durationMins)}</div>
+                    <div style={{ fontSize: 12, color: "#718096", marginTop: 2 }}>Sleep duration</div>
+                  </div>
+                  {form.percent != null && (
+                    <div style={{ textAlign: "center" }}>
+                      <div style={{ fontSize: 22, fontWeight: 800, color: "#ffffff" }}>{form.percent}%</div>
+                      <div style={{ fontSize: 12, color: "#718096", marginTop: 2 }}>Efficiency</div>
+                    </div>
+                  )}
+                </div>
+              )}
+            </Section>
+
+            <Section label="Quality">
+              <Row label="Feel">
+                <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+                  {FEEL_OPTIONS.map(f => (
+                    <button key={f} onClick={() => handleChange("feel", f)} style={{ padding: "5px 9px", border: "none", borderRadius: 8, fontSize: 11, cursor: "pointer", fontWeight: 600, background: form.feel === f ? FEEL_COLOR[f] : "#2d3748", color: form.feel === f ? "white" : "#718096" }}>{f}</button>
+                  ))}
+                </div>
+              </Row>
+              <Row label="Wake-ups"><input type="number" value={form.interuptCount} onChange={e => handleChange("interuptCount", e.target.value)} style={{ ...IS, width: 70 }} min={0} /></Row>
+              <Row label="Left bed"><input type="number" value={form.leftBed} onChange={e => handleChange("leftBed", e.target.value)} style={{ ...IS, width: 70 }} min={0} /></Row>
+            </Section>
+
+            <Section label="Supplements">
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 10 }}>
+                {SUPP_LIST.map(s => {
+                  const on = form.suppSelected.includes(s);
+                  return (
+                    <button key={s} onClick={() => handleChange("suppSelected", on ? form.suppSelected.filter(x => x !== s) : [...form.suppSelected, s])}
+                      style={{ padding: "7px 14px", border: "none", borderRadius: 20, fontSize: 13, cursor: "pointer", fontWeight: 700, background: on ? "#4f46e5" : "#2d3748", color: on ? "white" : "#718096" }}>
+                      {s}
+                    </button>
+                  );
+                })}
+              </div>
+              {(form.suppSelected.length > 0 || form.suppExtra) && (
+                <div style={{ fontSize: 11, color: "#818cf8", marginBottom: 8, fontStyle: "italic" }}>
+                  → {[...SUPP_LIST.filter(s => form.suppSelected.includes(s)), form.suppExtra && form.suppExtra.trim()].filter(Boolean).join(" + ")}
+                </div>
+              )}
+              <input value={form.suppExtra} onChange={e => handleChange("suppExtra", e.target.value)}
+                placeholder="+ extras (e.g. Ashwa(1.5), cold meds...)"
+                style={{ ...IS, width: "100%", fontSize: 12 }} />
+            </Section>
+
+            <Section label="Food & Activity">
+              <Row label="Lunch"><input value={form.lunch} onChange={e => handleChange("lunch", e.target.value)} style={{ ...IS, flex: 1 }} placeholder="What you had..." /></Row>
+              <Row label="Dinner"><input value={form.dinner} onChange={e => handleChange("dinner", e.target.value)} style={{ ...IS, flex: 1 }} placeholder="What you had..." /></Row>
+              <Row label="Gym">
+                <div style={{ display: "flex", gap: 6 }}>
+                  {["Yes", "No"].map(v => (
+                    <button key={v} onClick={() => handleChange("gym", v)} style={{ padding: "5px 16px", border: "none", borderRadius: 8, cursor: "pointer", fontSize: 12, fontWeight: 600,
+                      background: form.gym === v ? (v === "Yes" ? "#065f46" : "#4a1942") : "#2d3748",
+                      color: form.gym === v ? (v === "Yes" ? "#6ee7b7" : "#f9a8d4") : "#718096" }}>{v}</button>
+                  ))}
+                </div>
+              </Row>
+            </Section>
+
+            <Section label="Notes">
+              <textarea value={form.comment} onChange={e => handleChange("comment", e.target.value)}
+                placeholder="How was the night..." style={{ ...IS, width: "100%", height: 70, lineHeight: 1.4 }} />
+              <div style={{ marginTop: 8 }}>
+                <div style={{ fontSize: 11, color: "#4a5568", marginBottom: 4 }}>Next day notes</div>
+                <textarea value={form.nextDay} onChange={e => handleChange("nextDay", e.target.value)}
+                  placeholder="How you felt next day..." style={{ ...IS, width: "100%", height: 50, lineHeight: 1.4 }} />
+              </div>
+            </Section>
+
+            <button onClick={handleSave} disabled={syncing} style={{ width: "100%", padding: 14, background: syncing ? "#2d3748" : "linear-gradient(135deg,#4f46e5,#7c3aed)", border: "none", borderRadius: 12, color: "white", fontWeight: 700, fontSize: 15, cursor: syncing ? "not-allowed" : "pointer", marginBottom: 24 }}>
+              {syncing ? "Saving to Sheet..." : editId ? "Save Changes" : "Save Entry"}
+            </button>
+          </div>
+        )}
+
+        {/* HISTORY */}
+        {view === "history" && (
+          <div>
+            <div style={{ fontSize: 13, color: "#4a5568", marginBottom: 12 }}>{entries.length} entries — tap to edit</div>
+            {sorted.map(e => {
+              const badAwake = e.interuptMins != null && e.interuptMins > 90;
+              const badSleepMin = e.sleepMin > 90;
+              const badPercent = e.percent != null && e.percent < 80;
+              return (
+              <div key={e.id} ref={el => rowRefs.current[e.id] = el} onClick={() => startEdit(e)} style={{ background: "#1a2035", borderRadius: 10, padding: "10px 12px", marginBottom: 8, border: `1px solid ${(FEEL_COLOR[e.feel] || "#2d3748")}25`, cursor: "pointer", display: "flex", alignItems: "center", gap: 10 }}>
+                <div style={{ width: 6, borderRadius: 3, alignSelf: "stretch", minHeight: 40, background: FEEL_COLOR[e.feel] || "#2d3748" }} />
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                    <div style={{ fontSize: 15, fontWeight: 600, color: "#a0aec0" }}>{formatDate(e.date)}</div>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      <span style={{ fontSize: 13, color: "#718096" }}>⏱ {fmtDuration(e.durationMins)}</span>
+                      <span style={{ fontSize: 13, color: FEEL_COLOR[e.feel] || "#718096", fontWeight: 700 }}>{e.feel || "—"}</span>
+                    </div>
+                  </div>
+                  <div style={{ display: "flex", gap: 12, marginTop: 4, flexWrap: "wrap" }}>
+                    {e.percent != null && <span style={{ fontSize: 13, color: badPercent ? "#f87171" : "#718096", fontWeight: badPercent ? 700 : 400 }}>⚡ {e.percent}%</span>}
+                    {e.interuptMins != null && <span style={{ fontSize: 13, color: badAwake ? "#f87171" : "#718096", fontWeight: badAwake ? 700 : 400 }}>💤 {e.interuptMins}m awake</span>}
+                    {badSleepMin && <span style={{ fontSize: 13, color: "#f87171", fontWeight: 700 }}>⏳ {e.sleepMin}m to sleep</span>}
+                    {e.gym === "Yes" && <span style={{ fontSize: 13, color: "#68d391" }}>🏋️</span>}
+                  </div>
+                  {e.comment && <div style={{ fontSize: 12, color: "#4a5568", marginTop: 3, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{e.comment}</div>}
+                </div>
+                <div style={{ color: "#4a5568", fontSize: 14 }}>›</div>
+              </div>
+              );
+            })}
+          </div>
+        )}
+
+      </div>
+    </div>
+
+    {chartExpanded && (
+      <div style={{ position: "fixed", inset: 0, background: "#0f1117", zIndex: 1000, display: "flex", flexDirection: "column", fontFamily: "system-ui,sans-serif", color: "#e2e8f0" }}>
+        <button onClick={() => { setChartExpanded(false); setScrubIndex(null); }}
+          style={{ position: "absolute", top: 10, right: 10, zIndex: 2, background: "#1a2035", border: "none", color: "#e2e8f0", width: 32, height: 32, borderRadius: 16, fontSize: 16, cursor: "pointer" }}>
+          ✕
+        </button>
+
+        {!isLandscape ? (
+          <div style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: 24, textAlign: "center" }}>
+            <div style={{ fontSize: 40, marginBottom: 12 }}>🔄</div>
+            <div style={{ color: "#a0aec0", fontSize: 15 }}>Rotate your phone to landscape to view the full chart</div>
+          </div>
+        ) : (() => {
+          const WINDOW = 90;
+          const TARGET = 450;
+          const allSorted = sorted.slice().reverse();
+          const chartW = 900, chartH = 260;
+          const chart = buildRollingChart(allSorted, chartOffset, WINDOW, chartW, chartH, TARGET);
+          if (!chart) {
+            return <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", color: "#4a5568" }}>Not enough data yet</div>;
+          }
+          const { pts, pathD, targetY, labelPts, peakPoint, troughPoint, minVal, range, canGoBack, canGoForward, windowLabel } = chart;
+
+          const scrubPt = scrubIndex != null ? pts[Math.min(scrubIndex, pts.length - 1)] : null;
+
+          function handlePointer(ev) {
+            const svg = ev.currentTarget;
+            const rect = svg.getBoundingClientRect();
+            const clientX = ev.touches ? ev.touches[0].clientX : ev.clientX;
+            const relX = clientX - rect.left;
+            const scale = chartW / rect.width;
+            const x = relX * scale;
+            let nearest = 0, minDist = Infinity;
+            pts.forEach((p, i) => {
+              const d = Math.abs(p.x - x);
+              if (d < minDist) { minDist = d; nearest = i; }
+            });
+            setScrubIndex(nearest);
+          }
+
+          return (
+            <div style={{ flex: 1, display: "flex", flexDirection: "column", padding: "12px 16px" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+                <div style={{ fontSize: 13, fontWeight: 700, color: "#818cf8", textTransform: "uppercase", letterSpacing: 0.8 }}>7-Day Rolling Avg</div>
+                <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                  <button onClick={() => { setScrubIndex(null); setChartOffset(o => o + WINDOW); }} disabled={!canGoBack}
+                    style={{ background: "none", border: "none", color: canGoBack ? "#818cf8" : "#2d3748", fontSize: 20, cursor: canGoBack ? "pointer" : "default", padding: "0 4px", lineHeight: 1 }}>‹</button>
+                  <span style={{ fontSize: 12, color: "#4a5568" }}>{windowLabel}</span>
+                  <button onClick={() => { setScrubIndex(null); setChartOffset(o => Math.max(0, o - WINDOW)); }} disabled={!canGoForward}
+                    style={{ background: "none", border: "none", color: canGoForward ? "#818cf8" : "#2d3748", fontSize: 20, cursor: canGoForward ? "pointer" : "default", padding: "0 4px", lineHeight: 1 }}>›</button>
+                </div>
+              </div>
+
+              <div style={{ flex: 1, minHeight: 0 }}>
+                <svg width="100%" height="100%" viewBox={`0 0 ${chartW} ${chartH + 24}`} style={{ display: "block", touchAction: "none" }}
+                  onPointerDown={(ev) => { ev.currentTarget.setPointerCapture(ev.pointerId); handlePointer(ev); }}
+                  onPointerMove={(ev) => { if (ev.buttons === 1) handlePointer(ev); }}>
+                  <line x1="0" y1={targetY.toFixed(1)} x2={chartW} y2={targetY.toFixed(1)}
+                    stroke="#4a5568" strokeWidth="1" strokeDasharray="5,4" />
+                  <path d={`${pathD} L${pts[pts.length-1].x},${chartH} L0,${chartH} Z`}
+                    fill="#818cf8" fillOpacity="0.1" />
+                  <path d={pathD} fill="none" stroke="#818cf8" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" />
+                  {[pts[0], pts[pts.length - 1]].map((p, i) => (
+                    <circle key={i} cx={p.x.toFixed(1)} cy={p.y.toFixed(1)} r="4" fill="#818cf8" />
+                  ))}
+                  {labelPts.map((p, i) => (
+                    <text key={i} x={p.x.toFixed(1)} y={chartH + 18} textAnchor="middle" fontSize="11" fill="#e2e8f0">
+                      {dateShort(p.date)}
+                    </text>
+                  ))}
+                  {[minVal, TARGET].map((v, i) => (
+                    <text key={i} x="4" y={chartH - ((v - minVal) / range) * chartH} fontSize="11" fill="#4a5568" dominantBaseline="middle">
+                      {Math.floor(v/60)}h{v%60 > 0 ? `${v%60}m` : ""}
+                    </text>
+                  ))}
+                  <circle cx={peakPoint.x.toFixed(1)} cy={peakPoint.y.toFixed(1)} r="5" fill="#fbbf24" stroke="#0f1117" strokeWidth="2" />
+                  <text x={peakPoint.x.toFixed(1)} y={(peakPoint.y > chartH / 2 ? peakPoint.y - 12 : peakPoint.y + 20).toFixed(1)} textAnchor="middle" fontSize="11" fontWeight="700" fill="#fbbf24">
+                    {dateShort(peakPoint.date)}
+                  </text>
+                  {troughPoint.date !== peakPoint.date && (
+                    <>
+                      <circle cx={troughPoint.x.toFixed(1)} cy={troughPoint.y.toFixed(1)} r="5" fill="#60a5fa" stroke="#0f1117" strokeWidth="2" />
+                      <text x={troughPoint.x.toFixed(1)} y={(troughPoint.y > chartH / 2 ? troughPoint.y - 12 : troughPoint.y + 20).toFixed(1)} textAnchor="middle" fontSize="11" fontWeight="700" fill="#60a5fa">
+                        {dateShort(troughPoint.date)}
+                      </text>
+                    </>
+                  )}
+                  {scrubPt && (
+                    <>
+                      <line x1={scrubPt.x.toFixed(1)} y1="0" x2={scrubPt.x.toFixed(1)} y2={chartH} stroke="#e2e8f0" strokeWidth="1.5" strokeDasharray="3,3" />
+                      <circle cx={scrubPt.x.toFixed(1)} cy={scrubPt.y.toFixed(1)} r="6" fill="#0f1117" stroke="#e2e8f0" strokeWidth="2.5" />
+                    </>
+                  )}
+                </svg>
+              </div>
+
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 14, marginTop: 8, minHeight: 30 }}>
+                {scrubPt ? (
+                  <>
+                    <button onClick={() => setScrubIndex(i => Math.max(0, i - 1))} disabled={scrubIndex === 0}
+                      style={{ background: "none", border: "none", color: scrubIndex === 0 ? "#2d3748" : "#818cf8", fontSize: 18, cursor: scrubIndex === 0 ? "default" : "pointer" }}>‹</button>
+                    <div style={{ fontSize: 14, color: "#e2e8f0" }}>
+                      <span style={{ fontWeight: 700 }}>{dateShort(scrubPt.date)}</span>
+                      <span style={{ color: "#4a5568", margin: "0 6px" }}>·</span>
+                      <span style={{ color: "#818cf8", fontWeight: 700 }}>{fmtDuration(Math.round(scrubPt.avg))}</span>
+                      <span style={{ color: "#4a5568" }}> avg</span>
+                    </div>
+                    <button onClick={() => setScrubIndex(i => Math.min(pts.length - 1, i + 1))} disabled={scrubIndex === pts.length - 1}
+                      style={{ background: "none", border: "none", color: scrubIndex === pts.length - 1 ? "#2d3748" : "#818cf8", fontSize: 18, cursor: scrubIndex === pts.length - 1 ? "default" : "pointer" }}>›</button>
+                  </>
+                ) : (
+                  <div style={{ fontSize: 12, color: "#4a5568" }}>Tap or drag the chart to inspect a date</div>
+                )}
+              </div>
+            </div>
+          );
+        })()}
+      </div>
+    )}
+    </>
+  );
+}
+
+ReactDOM.render(<App />, document.getElementById("app"));
+</script>
+</body>
+</html>
